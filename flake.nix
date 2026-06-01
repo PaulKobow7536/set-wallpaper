@@ -1,5 +1,5 @@
 {
-  description = "Reddit wallpaper fetcher service";
+  description = "Wallhaven wallpaper fetcher service";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -28,84 +28,44 @@
           cfg = config.services.wallpaper;
 
           wallpaperScript = pkgs.writeShellScriptBin "get-wallpaper" ''
-            set -e
+            set -eo pipefail
+            set -x
             time=$(date +%s)
-            tries=0
             wallpaper_path="$HOME/.wallpaper"
-
             mkdir -p "$wallpaper_path"
 
-            addJpegIfImgur(){
-              while read url; do
-                isImgur=$(echo "$url" | grep imgur)
-                url=$(echo "$url" | sed -e 's/"url": "//' -e 's/",//' -e 's/gallery\///')
-                [[ -z "$isImgur" ]] && echo "$url" || echo "$url" | sed -e 's/$/\.jpg/'
-              done
-            }
+            echo "Fetching wallpaper from wallhaven..."
 
-            startOver(){
-              [[ -z "$1" ]] && echo "error" || echo "$1"
-              rm "$wallpaper_path/$time.jpg" 2>/dev/null
-              sleep 1
-              getWallpaper "retry"
-            }
+            tag=$(echo "${lib.concatStringsSep "\n" cfg.tags}" | shuf | head -n 1)
 
-            setWallpaper(){
-              echo "Setting wallpaper..."
-              ${cfg.setWallpaperCmd} "$1"
-            }
+            img_url=$(${pkgs.curl}/bin/curl -sf \
+              "https://wallhaven.cc/api/v1/search?categories=${cfg.categories}&purity=${cfg.purity}&atleast=${cfg.minResolution}&sorting=random&ratios=${cfg.ratios}&q=$tag" \
+              | ${pkgs.jq}/bin/jq -r 'if (.data | length) > 0 then .data[0].path else error("no results") end')
 
-            getWallpaper(){
-              if [[ $tries -gt 100 ]]; then
-                echo "too many failed attempts, exiting"
-                exit 1
-              fi
-              tries=$((tries+1))
-              [[ -z "$1" ]] || echo "that didn't work, let's try again"
-              echo "getting wallpaper..."
+            echo "Downloading: $img_url"
+            ext="''${img_url##*.}"
+            tmp="/tmp/$time.$ext"
 
-              subreddit=$(echo -e "${lib.concatStringsSep "\\n" cfg.subreddits}" | shuf -n 1)
+            ${pkgs.wget}/bin/wget -q -O "$tmp" "$img_url"
 
-              RESULT=$(${pkgs.curl}/bin/curl -s -A "wallpaper bot" \
-                "https://www.reddit.com/r/$subreddit/.json" \
-                | ${pkgs.python3}/bin/python3 -m json.tool \
-                | ${pkgs.gnugrep}/bin/grep -P '\"url\": \"htt(p|ps):\/\/((i.+)?imgur.com\/(?!.\/)[A-z0-9]{5,7}|i.redd.it|staticflickr.com)' \
-                | addJpegIfImgur \
-                | shuf -n 1 \
-                | xargs ${pkgs.wget}/bin/wget -O "/tmp/$time.jpg" 2>/dev/null) || true
 
-              [[ ! -f "/tmp/$time.jpg" ]] && startOver "Image not downloaded"
+            hash=$(${pkgs.coreutils}/bin/sha256sum "$tmp" | cut -d " " -f 1)
 
-              hash=$(${pkgs.coreutils}/bin/sha256sum "/tmp/$time.jpg" | cut -d " " -f 1)
-              [[ -f "$wallpaper_path/$hash.jpg" ]] && startOver "Already have this one"
-
-              mv "/tmp/$time.jpg" "$wallpaper_path/$hash.jpg"
-
-              echo "Setting image..."
-              setWallpaper "$wallpaper_path/$hash.jpg"
-              echo "Done"
+            if [[ -f "$wallpaper_path/$hash.$ext" ]]; then
+              echo "Already have this wallpaper, skipping"
+              rm "$tmp"
               exit 0
-            }
+            fi
 
-            getWallpaper
+            mv "$tmp" "$wallpaper_path/$hash.$ext"
+            echo "Setting wallpaper..."
+            ${cfg.setWallpaperCmd} "$wallpaper_path/$hash.$ext"
+            echo "Done"
           '';
         in
         {
           options.services.wallpaper = {
-            enable = lib.mkEnableOption "Reddit wallpaper fetcher";
-
-            subreddits = lib.mkOption {
-              type = lib.types.listOf lib.types.str;
-              default = [
-                "earthporn"
-                "wallpapers"
-                "Wallpaper"
-                "4kWallpaper"
-                "WQHD_Wallpaper"
-                "spaceporn"
-              ];
-              description = "List of subreddits to fetch wallpapers from";
-            };
+            enable = lib.mkEnableOption "Wallhaven wallpaper fetcher";
 
             setWallpaperCmd = lib.mkOption {
               type = lib.types.str;
@@ -113,10 +73,45 @@
               description = "Command to set the wallpaper. The image path will be appended as the last argument.";
             };
 
+            minResolution = lib.mkOption {
+              type = lib.types.str;
+              default = "1920x1080";
+              description = "Minimum resolution filter (wallhaven atleast parameter)";
+            };
+
+            ratios = lib.mkOption {
+              type = lib.types.str;
+              default = "16x9";
+              description = "Aspect ratio filter (wallhaven ratios parameter)";
+            };
+
+            categories = lib.mkOption {
+              type = lib.types.str;
+              default = "100";
+              description = "Wallhaven categories bitmask: general/anime/people (e.g. '100' = general only, '111' = all)";
+            };
+
+            purity = lib.mkOption {
+              type = lib.types.str;
+              default = "100";
+              description = "Wallhaven purity bitmask: sfw/sketchy/nsfw (e.g. '100' = sfw only)";
+            };
+
+            tags = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [
+                "nature"
+                "cars"
+                "abstract"
+                "linux"
+              ];
+              description = "List of tags to filter wallpapers by";
+            };
+
             interval = lib.mkOption {
               type = lib.types.str;
               default = "1h";
-              description = "How often to fetch a new wallpaper (systemd calendar format)";
+              description = "How often to fetch a new wallpaper (systemd OnUnitActiveSec format)";
             };
           };
 
@@ -124,10 +119,15 @@
             home.packages = [ wallpaperScript ];
 
             systemd.user.services.wallpaper = {
-              Unit.Description = "Fetch and set random Reddit wallpaper";
+              Unit = {
+                Description = "Fetch and set random wallpaper from wallhaven";
+                After = [ "network-online.target" ];
+              };
               Service = {
                 Type = "oneshot";
                 ExecStart = "${wallpaperScript}/bin/get-wallpaper";
+                Restart = "on-failure";
+                RestartSec = "30s";
               };
             };
 
